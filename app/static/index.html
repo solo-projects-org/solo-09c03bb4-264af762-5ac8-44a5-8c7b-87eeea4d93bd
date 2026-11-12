@@ -78,6 +78,22 @@
   .sol-block h4 { margin: 4px 0; color: var(--amber); }
   #global-error { display: none; }
   .spacer { flex: 1; }
+  #slot-bar {
+    display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-top: 12px; padding: 9px 14px; border-radius: 8px;
+    background: var(--gray-bg); border: 1px solid var(--line);
+    font-size: 13px;
+  }
+  #slot-bar.busy { display: flex; background: var(--amber-bg); border-color: var(--amber); }
+  #slot-bar .dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--amber);
+    box-shadow: 0 0 0 0 rgba(210,153,34,.7); animation: pulse 1.6s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(210,153,34,.6); }
+    70% { box-shadow: 0 0 0 8px rgba(210,153,34,0); }
+    100% { box-shadow: 0 0 0 0 rgba(210,153,34,0); }
+  }
   footer { color: var(--muted); text-align: center; padding: 24px; font-size: 12.5px; }
 </style>
 </head>
@@ -91,10 +107,16 @@
     <div class="upload-bar">
       <input type="file" id="fileInput" accept=".csv,text/csv">
       <button class="secondary" id="sampleBtn">📦 载入内置夏令时样例</button>
+      <button class="secondary" id="largeSampleBtn">📦 载入大批样例（≥1 MiB）</button>
       <button id="solveBtn" disabled>开始清洗</button>
       <span class="file-name" id="fileName">未选择文件</span>
       <span class="spacer"></span>
       <button class="export" id="exportAllBtn" disabled>⬇ 导出全部可导出机尾</button>
+    </div>
+    <div id="slot-bar">
+      <span class="dot"></span>
+      <span id="slot-text"></span>
+      <span class="note">大批清洗与 UTC 导出共用一个名额，占用期间新的大批请求会被拒绝（不排队）；小批清洗与样例载入不受影响。</span>
     </div>
     <details>
       <summary>CSV 格式与求解规则</summary>
@@ -111,6 +133,9 @@
         <li>约束：飞行时长 ∈ [下限, 上限]，且下一段起飞不得早于上一段落地；</li>
         <li>整链<b>唯一解</b>才允许导出该机尾的 UTC CSV；无解展示冲突航段，多解展示可行候选，均禁止导出。</li>
       </ul>
+      <p><b>大批名额（并发规则）：</b>源 CSV 达到 <code>1 MiB</code> 即为大批。大批清洗与生成 UTC CSV
+      共用<b>同一个大批名额</b>，名额占用期间再提交大批请求会立即提示稍后重试（不排队）；
+      名额在作业完成或失败后释放，与发起窗口是否关闭无关。小批清洗（&lt; 1 MiB）与样例载入始终可并发进行，不受大批影响。</p>
     </details>
   </div>
 
@@ -136,6 +161,29 @@ const STATUS_META = {
   error:       {label: '数据错误 · 禁止导出', cls: 'error'},
 };
 
+// ---- 大批名额状态轮询（清洗与 UTC 导出共用一个名额）----
+async function refreshSlot() {
+  try {
+    const resp = await fetch('/api/slot', {cache: 'no-store'});
+    const data = await resp.json();
+    const bar = $('slot-bar');
+    if (data.busy && data.current) {
+      const c = data.current;
+      const kind = c.kind === 'export' ? 'UTC 导出' : '清洗';
+      $('slot-text').textContent =
+        `大批名额占用中：${kind}作业 ${c.id}（${c.size_mib} MiB，开始于 ${new Date(c.started_at).toLocaleTimeString()}）`;
+      bar.classList.add('busy');
+    } else {
+      bar.classList.remove('busy');
+    }
+  } catch (e) { /* 轮询失败静默，下一轮自然恢复 */ }
+}
+setInterval(refreshSlot, 3000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshSlot();
+});
+refreshSlot();
+
 $('fileInput').addEventListener('change', (e) => {
   currentFile = e.target.files[0] || null;
   $('fileName').textContent = currentFile ? currentFile.name : '未选择文件';
@@ -151,6 +199,23 @@ $('sampleBtn').addEventListener('click', async () => {
   $('fileInput').value = '';
 });
 
+$('largeSampleBtn').addEventListener('click', async () => {
+  hideGlobalError();
+  const resp = await fetch('/api/sample/large');
+  if (!resp.ok) {
+    let msg = '大批样例不可用';
+    try { msg = (await resp.json()).detail || msg; } catch (e) {}
+    showGlobalError(msg);
+    return;
+  }
+  const blob = await resp.blob();
+  currentFile = new File([blob], 'dst_sample_large.csv', {type: 'text/csv'});
+  const mib = (blob.size / 1048576).toFixed(2);
+  $('fileName').textContent = `已载入大批样例 dst_sample_large.csv（${mib} MiB）`;
+  $('solveBtn').disabled = false;
+  $('fileInput').value = '';
+});
+
 $('solveBtn').addEventListener('click', async () => {
   hideGlobalError();
   $('results').innerHTML = '';
@@ -162,13 +227,18 @@ $('solveBtn').addEventListener('click', async () => {
   try {
     const resp = await fetch('/api/solve', {method: 'POST', body: fd});
     const data = await resp.json();
-    if (!resp.ok) { showGlobalError(data.detail || '求解失败'); return; }
+    if (!resp.ok) {
+      if (resp.status === 503) showGlobalError('⏳ ' + (data.detail || '大批名额占用中，请稍后重试'));
+      else showGlobalError(data.detail || '求解失败');
+      return;
+    }
     lastResult = data;
     render(data);
   } catch (err) {
     showGlobalError('请求失败: ' + err);
   } finally {
     $('solveBtn').disabled = false;
+    refreshSlot();
   }
 });
 
@@ -298,11 +368,18 @@ async function doExport(tail) {
   const fd = new FormData();
   fd.append('file', currentFile);
   fd.append('tail', tail);
-  const resp = await fetch('/api/export', {method: 'POST', body: fd});
+  let resp;
+  try {
+    resp = await fetch('/api/export', {method: 'POST', body: fd});
+  } catch (err) {
+    alert('⚠ 请求失败: ' + err);
+    return;
+  }
   if (!resp.ok) {
     let msg = '导出被拒绝';
     try { msg = (await resp.json()).detail || msg; } catch (e) {}
-    alert('⚠ ' + msg);
+    alert((resp.status === 503 ? '⏳ ' : '⚠ ') + msg);
+    refreshSlot();
     return;
   }
   const blob = await resp.blob();
@@ -313,6 +390,7 @@ async function doExport(tail) {
   a.download = m ? m[1] : 'utc_export.csv';
   a.click();
   URL.revokeObjectURL(a.href);
+  refreshSlot();
 }
 </script>
 </body>

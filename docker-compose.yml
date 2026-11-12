@@ -4,4 +4,15 @@ services:
     container_name: dst-time-cleaner
     ports:
       - "8000:8000"
+    environment:
+      # 大批作业开始前的可选演示延迟（秒），默认 0 即关闭。
+      # 设为 12 后，双窗口演示时可清楚观察：大批占用名额 → 另一大批立即 503、
+      # 小批清洗与样例载入照常返回 → 作业结束自动释放名额。
+      LARGE_JOB_DELAY_SECONDS: "12"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped

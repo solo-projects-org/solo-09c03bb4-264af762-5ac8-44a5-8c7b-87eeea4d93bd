@@ -11,6 +11,10 @@ docker compose up --build
 
 浏览器打开 <http://localhost:8000> ，点击「📦 载入内置夏令时样例」→「开始清洗」即可看到完整演示。
 
+> Compose 默认设置了 `LARGE_JOB_DELAY_SECONDS=12`：大批作业开始前会等待 12 秒，
+> 方便在两个浏览器窗口里观察名额占用/拒入/释放过程。生产环境把该变量删掉或设为 `0` 即可，
+> 不影响任何求解结果。
+
 本地开发（不用 Docker）：
 
 ```bash
@@ -19,7 +23,50 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-自检（仅标准库）：`python3 tests/test_solver.py`
+自检（仅标准库；HTTP 并发自检需要能 import uvicorn）：
+
+```bash
+python3 -I tests/test_solver.py   # 求解规则
+python3 -I tests/test_jobs.py     # 大批名额管理器
+python3 -I tests/test_api.py      # HTTP 级并发/拒入/断线存活
+```
+
+## 大批名额与并发模型
+
+清洗与 UTC 导出都是 CPU 密集求解，原先直接跑在事件循环里，一个大文件会阻塞所有窗口。
+现在的模型：
+
+- **阈值**：源 CSV 字节数 **达到 1 MiB（含 1 MiB 整）** 即为大批，判定只看上传字节数，与内容无关；
+- **单名额**：进程内只有一个大批名额，大批清洗与大批 UTC 导出**共用**。名额被占时新的大批请求
+  **立即返回 `503 + Retry-After` 提示稍后重试，不排队**；
+- **互不阻塞**：求解在线程池执行（事件循环只做 I/O）。大批走单 worker 池，小批（< 1 MiB）走独立的
+  4 worker 池。因此大批运行时，另一窗口仍可载入样例并完成小批清洗；
+- **与窗口生命周期解耦**：名额在 worker 的 `finally` 中释放。关掉发起窗口（HTTP 断开）不会取消
+  线程里的作业，它继续占用名额，**完成或失败后自动释放**；
+- **沿用不变**：10 MB 上传上限（超出 413）、整链唯一解判定、导出列与 UTC 格式完全保持原样。
+
+### 两个浏览器窗口并行演示
+
+1. `docker compose up --build` 后，开两个浏览器窗口都访问 <http://localhost:8000>；
+2. 窗口 A 点「📦 载入大批样例（≥1 MiB）」→「开始清洗」。顶部出现琥珀色名额占用条，
+   作业约 12 秒后返回；
+3. 名额占用期间在窗口 B：
+   - 点「📦 载入内置夏令时样例」→「开始清洗」：**小批立即出结果**，不被 A 阻塞；
+   - 也可在窗口 B 载入大批样例再清洗：**立即收到「稍后重试」503 提示**（不排队）；
+   - 窗口 B 对大批文件点导出 UTC CSV 同样被 503 拒绝（清洗/导出共用名额）；
+4. 窗口 A 的作业结束后名额条消失，窗口 B 再提交大批即可成功；
+5. 验证关窗口语义：窗口 A 提交大批后立刻关闭该窗口，在窗口 B 观察名额条仍在，
+   到点后自动消失（作业跑完释放名额）。
+
+### 大批样例与生成脚本
+
+- 现成样例：`samples/dst_sample_large.csv`（1.5 MiB，469 个机尾、每机尾 40 段，全部整链唯一解，可直接导出）；
+- 重新生成（仅标准库）：
+
+```bash
+python3 -I scripts/gen_large_sample.py                 # 默认 1.5 MiB
+python3 -I scripts/gen_large_sample.py --target-mib 4  # 自定义大小
+```
 
 ## 输入 CSV 格式
 
@@ -74,18 +121,25 @@ B-7001,1,2026-10-25 00:30,Europe/London,2026-10-25 02:15,Europe/Berlin,90,130
 | --- | --- | --- |
 | `GET` | `/` | 网页入口 |
 | `GET` | `/api/sample` | 下载内置样例 CSV |
-| `POST` | `/api/solve` | 上传 CSV（multipart 字段 `file`），返回逐机尾求解结果 JSON |
-| `POST` | `/api/export` | 字段 `file` + `tail`（`__all__` 表示全部可导出机尾），返回 UTC CSV；非唯一解 409 |
+| `GET` | `/api/sample/large` | 下载大批样例 CSV（≥ 1 MiB） |
+| `GET` | `/api/slot` | 大批名额状态：`{busy, current, large_threshold_bytes}` |
+| `POST` | `/api/solve` | 上传 CSV（multipart 字段 `file`），返回逐机尾求解结果 JSON；大批且名额被占时返回 503 |
+| `POST` | `/api/export` | 字段 `file` + `tail`（`__all__` 表示全部可导出机尾），返回 UTC CSV；非唯一解 409，大批名额被占 503 |
 | `GET` | `/docs` | FastAPI 自动文档 |
 
 ## 目录结构
 
 ```
 app/
-  main.py            # FastAPI 路由
+  main.py            # FastAPI 路由（求解下沉线程池，大批名额 503 拒入）
+  jobs.py            # 大批名额 + 大/小批隔离线程池（纯标准库）
   solver.py          # 候选生成 + 整链求解 + 冲突定位（纯标准库）
-  static/index.html  # 单页前端
-samples/dst_sample.csv
-tests/test_solver.py
+  static/index.html  # 单页前端（名额状态条、503 提示、大批样例一键载入）
+samples/dst_sample.csv        # 小批 DST 样例
+samples/dst_sample_large.csv  # 大批样例（1.5 MiB，脚本生成）
+scripts/gen_large_sample.py   # 大批样例生成脚本（仅标准库）
+tests/test_solver.py          # 求解规则自检
+tests/test_jobs.py            # 名额管理器自检
+tests/test_api.py             # HTTP 级并发/拒入/断线存活自检
 Dockerfile / docker-compose.yml / requirements.txt
 ```
